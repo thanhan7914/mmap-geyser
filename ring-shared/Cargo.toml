@@ -1,0 +1,12 @@
+[package]
+name = "ring-shared"
+version = "0.1.0"
+edition = "2024"
+authors = ["An Phan <thanhan7914@gmail.com>"]
+
+[lib]
+name = "ring_shared"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

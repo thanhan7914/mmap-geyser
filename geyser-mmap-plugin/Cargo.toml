@@ -1,0 +1,19 @@
+[package]
+name = "geyser-mmap-plugin"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ring-shared = { path = "../ring-shared" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+agave-geyser-plugin-interface = "3"
+solana-program = "3.0"
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
