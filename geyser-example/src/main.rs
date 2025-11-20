@@ -2,6 +2,8 @@ use anchor_client::solana_sdk::pubkey::Pubkey;
 use clap::Parser;
 use core::sync::atomic::Ordering::*;
 use ring_shared::{MmapRing, RecHdr, futex_wait};
+use std::io::Write;
+use std::net::TcpStream;
 use std::path::Path;
 use tokio::task;
 
@@ -24,6 +26,8 @@ async fn main() -> std::io::Result<()> {
 
     let hdr = unsafe { &*ring.hdr };
     let mut last_seq = hdr.notify_seq.load(Relaxed);
+
+    add_accounts(vec!["SysvarC1ock11111111111111111111111111111111"]);
 
     loop {
         let head = hdr.head.load(Acquire);
@@ -137,4 +141,20 @@ fn handle_slot(p: &[u8]) {
     println!("===== slot =====");
     println!("slot:   {}", slot);
     println!("status: {}", status);
+}
+
+fn add_accounts<S: AsRef<str>>(accounts: Vec<S>) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect("127.0.0.1:19999")?;
+
+    let acc: Vec<String> = accounts.iter().map(|s| s.as_ref().to_string()).collect();
+    let cmd = format!(
+        r#"{{"cmd":"add_accounts","accounts":{}}}"#,
+        serde_json::to_string(&acc).unwrap()
+    );
+
+    stream.write_all(cmd.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    Ok(())
 }

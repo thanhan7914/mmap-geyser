@@ -418,6 +418,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "arc-swap"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69f7f8c3906b62b754cd5326047894316021dcfe5a194c8ea52bdd94934a3457"
+
+[[package]]
 name = "ark-bn254"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1587,6 +1593,7 @@ dependencies = [
  "anchor-lang",
  "clap",
  "ring-shared",
+ "serde_json",
  "tokio",
 ]
 
@@ -1595,6 +1602,7 @@ name = "geyser-mmap-plugin"
 version = "0.1.0"
 dependencies = [
  "agave-geyser-plugin-interface",
+ "arc-swap",
  "libc",
  "ring-shared",
  "serde",
@@ -7082,7 +7090,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

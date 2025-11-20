@@ -31,7 +31,8 @@ cargo build --release -p geyser-mmap-plugin
   "libpath": "target/release/libgeyser_mmap_plugin.so",
   "shm_path": "/dev/shm/geyser.ring",
   "ring_bytes": 67108864,
-  "max_record_bytes": 8388608
+  "max_record_bytes": 8388608,
+  "bind_address": "0.0.0.0:19999"
 }
 ```
 
