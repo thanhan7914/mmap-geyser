@@ -1,5 +1,5 @@
 #![allow(clippy::missing_safety_doc)]
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, compiler_fence};
+use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 use std::{fs::OpenOptions, io, os::unix::io::AsRawFd, path::Path};
 
 use libc::{
@@ -13,11 +13,12 @@ pub struct RingHeader {
     pub magic: u32,            // "MMAP" 0x4D4D4150
     pub version: u32,          // 1
     pub capacity: u64,         // bytes usable for record area
-    pub head: AtomicU64,       // write pos (producer)
+    pub head: AtomicU64,       // published write pos (visible to consumer)
+    pub write_pos: AtomicU64,  // reservation pointer for producers
     pub tail: AtomicU64,       // read pos (consumer)
     pub dropped: AtomicU64,    // number of record drop
     pub notify_seq: AtomicU32, // seq increase when publish (futex wake)
-    pub _pad: [u8; 28],        // pad to 64 bytes: 4+4+8+8+8+8+4+28=64
+    pub _pad: [u8; 20],        // pad to 64 bytes
 }
 
 #[repr(C, align(16))]
@@ -90,6 +91,7 @@ impl MmapRing {
             (*self.hdr).version = 1;
             (*self.hdr).capacity = capacity;
             (*self.hdr).head.store(0, Ordering::Relaxed);
+            (*self.hdr).write_pos.store(0, Ordering::Relaxed);
             (*self.hdr).tail.store(0, Ordering::Relaxed);
             (*self.hdr).dropped.store(0, Ordering::Relaxed);
             (*self.hdr).notify_seq.store(0, Ordering::Relaxed);
@@ -104,24 +106,32 @@ impl MmapRing {
     #[inline]
     fn read_u32_at(&self, off: u64) -> u32 {
         let cap = self.capacity() as usize;
-        let start = off as usize;
+        let start = off as usize % cap;
         let mut b = [0u8; 4];
+
         unsafe {
             if start + 4 <= cap {
                 std::ptr::copy_nonoverlapping(self.data.add(start), b.as_mut_ptr(), 4);
             } else {
                 let first = cap - start;
                 std::ptr::copy_nonoverlapping(self.data.add(start), b.as_mut_ptr(), first);
-                std::ptr::copy_nonoverlapping(self.data, b.as_mut_ptr().add(first), 4 - first);
+                std::ptr::copy_nonoverlapping(
+                    self.data,
+                    b.as_mut_ptr().add(first),
+                    4 - first,
+                );
             }
         }
+
+        fence(Ordering::Acquire);
         u32::from_le_bytes(b)
     }
 
     #[inline]
     fn write_bytes(&self, off: u64, src: &[u8]) {
         let cap = self.capacity() as usize;
-        let start = off as usize;
+        let start = off as usize % cap;
+
         unsafe {
             if start + src.len() <= cap {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), self.data.add(start), src.len());
@@ -142,6 +152,47 @@ impl MmapRing {
         (x + 15) & !15
     }
 
+    fn publish_record(&self, start: u64, end: u64) {
+        use core::hint::spin_loop;
+        use Ordering::*;
+        let hdr = unsafe { &*self.hdr };
+        let mut backoff = 1u32;
+        let mut spins = 0u32;
+        const MAX_BACKOFF: u32 = 256;
+        const YIELD_THRESHOLD: u32 = 10000;
+
+        loop {
+            let cur = hdr.head.load(Acquire);
+            if cur == start {
+                if hdr
+                    .head
+                    .compare_exchange(cur, end, Release, Acquire)
+                    .is_ok()
+                {
+                    unsafe {
+                        (*self.hdr).notify_seq.fetch_add(1, Release);
+                    }
+                    futex_wake(&hdr.notify_seq);
+                    break;
+                }
+            } else {
+                // Exponential backoff to reduce CPU usage
+                for _ in 0..backoff {
+                    spin_loop();
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                
+                // Yield after many spins to avoid hogging CPU
+                spins += 1;
+                if spins > YIELD_THRESHOLD {
+                    std::thread::yield_now();
+                    spins = 0;
+                    backoff = 1; // Reset backoff after yield
+                }
+            }
+        }
+    }
+
     fn advance_tail_one_record(&self) -> bool {
         use Ordering::*;
         let cap = self.capacity();
@@ -150,23 +201,27 @@ impl MmapRing {
             let tail = unsafe { (*self.hdr).tail.load(Acquire) };
             let head = unsafe { (*self.hdr).head.load(Acquire) };
 
-            if head <= tail {
+            if head.wrapping_sub(tail) == 0 {
                 return false;
             }
+
+            // Ensure producer has published (acquire barrier)
+            fence(Ordering::Acquire);
 
             let tmod = tail % cap;
             let len = self.read_u32_at(tmod) as u64;
 
-            // Validate header
-            if len < 16 || len > cap {
-                // Invalid header, force sync to head
+            // Validate: len must be valid and record must be fully published
+            let aligned_len = Self::align16(len);
+            if len < 16 || len > cap || tail + aligned_len > head {
+                // Invalid or incomplete record, force sync to head
                 unsafe {
                     (*self.hdr).tail.store(head, Release);
                 }
                 return false;
             }
 
-            let new_tail = tail + Self::align16(len);
+            let new_tail = tail + aligned_len;
 
             // CAS to advance tail
             match unsafe {
@@ -203,56 +258,49 @@ impl MmapRing {
             return false;
         }
 
-        loop {
-            // Load current head
-            let head = unsafe { (*self.hdr).head.load(Acquire) };
+        let reservation = loop {
             let tail = unsafe { (*self.hdr).tail.load(Acquire) };
-            let mut used = head - tail;
+            let write_pos = unsafe { (*self.hdr).write_pos.load(Acquire) };
+            let used = write_pos.wrapping_sub(tail);
 
-            // Drop records if out of cap
-            while used + total > cap {
+            if used + total > cap {
                 if !self.advance_tail_one_record() {
                     unsafe {
                         (*self.hdr).dropped.fetch_add(1, Relaxed);
                     }
                     return false;
                 }
-                let new_tail = unsafe { (*self.hdr).tail.load(Acquire) };
-                used = head - new_tail;
+                continue;
             }
 
-            let off = head % cap;
-
-            // Write payload before increasing head
-            let mut hb = [0u8; 16];
-            hb[0..4].copy_from_slice(&hdr.len.to_le_bytes());
-            hb[4..6].copy_from_slice(&hdr.kind.to_le_bytes());
-            hb[6..8].copy_from_slice(&hdr.flags.to_le_bytes());
-            hb[8..16].copy_from_slice(&hdr.seq.to_le_bytes());
-            self.write_bytes(off, &hb);
-
-            let poff = (off + 16) % cap;
-            self.write_bytes(poff, payload);
-
-            compiler_fence(Release);
-
+            let new_write = write_pos + total;
             match unsafe {
                 (*self.hdr)
-                    .head
-                    .compare_exchange_weak(head, head + total, AcqRel, Acquire)
+                    .write_pos
+                    .compare_exchange(write_pos, new_write, AcqRel, Acquire)
             } {
-                Ok(_) => {
-                    unsafe {
-                        (*self.hdr).notify_seq.fetch_add(1, Release);
-                    }
-                    futex_wake(&unsafe { &*self.hdr }.notify_seq);
-                    return true;
-                }
-                Err(_actual_head) => {
-                    continue;
-                }
+                Ok(_) => break write_pos,
+                Err(_) => continue,
             }
-        }
+        };
+
+        let off = reservation % cap;
+
+        let mut hb = [0u8; 16];
+        hb[0..4].copy_from_slice(&hdr.len.to_le_bytes());
+        hb[4..6].copy_from_slice(&hdr.kind.to_le_bytes());
+        hb[6..8].copy_from_slice(&hdr.flags.to_le_bytes());
+        hb[8..16].copy_from_slice(&hdr.seq.to_le_bytes());
+        self.write_bytes(off, &hb);
+
+        let poff = (off + 16) % cap;
+        self.write_bytes(poff, payload);
+
+        // Flush CPU cache to ensure writes are visible to other CPUs
+        fence(Ordering::Release);
+
+        self.publish_record(reservation, reservation + total);
+        true
     }
 }
 
